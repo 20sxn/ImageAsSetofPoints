@@ -38,6 +38,7 @@ def imgs_to_SoP(imgs):
     
     return SoP
 
+
 class GroupNorm(nn.GroupNorm):
     """
     Group Normalization with 1 group.
@@ -45,6 +46,7 @@ class GroupNorm(nn.GroupNorm):
     """
     def __init__(self, num_channels, **kwargs):
         super().__init__(1, num_channels, **kwargs)
+
 
 class PointReducer(nn.Module):
     def __init__(self, in_chan, out_chan, kernel_size=2, stride=2, norm_layer=None):
@@ -75,20 +77,19 @@ class Cluster(nn.Module):
         self.fold_h = fold_h
         
         self.fc1 = nn.Conv2d(in_channels,heads*head_dim,kernel_size = 1)
-            #heads*head_dim -> we place the heads in the batch later
+        #heads*head_dim -> we place the heads in the batch later
         self.fcv = nn.Conv2d(in_channels,heads*head_dim,kernel_size = 1)
         self.fc2 = nn.Conv2d(heads*head_dim,out_channels,kernel_size = 1)
         self.center_proposal = nn.AdaptiveAvgPool2d((proposal_w,proposal_h))
         
-        self.alpha = nn.Parameter(torch.ones(1)) #initialisation bizarre
-        self.beta = nn.Parameter(torch.zeros(1)) #initialisation bizarre
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.beta = nn.Parameter(torch.zeros(1))
         
-    def forward(self,x):
+    def forward(self,x,getmask = False):
         """
         x : [b,c,h,w]
         """
         _,_,h,w = x.shape 
-        
         val = self.fcv(x)
         x = self.fc1(x)
 
@@ -116,6 +117,7 @@ class Cluster(nn.Module):
         mask = torch.zeros_like(sim) #(b,m,n)
         mask.scatter_(1, sim_argmax, 1.)
         sim= sim*mask
+
         
         #computing aggregated feature
         val = rearrange(val, 'b c h w -> b (h w) c')
@@ -123,16 +125,21 @@ class Cluster(nn.Module):
         
         out = (out.unsqueeze(dim=2)*sim.unsqueeze(dim=-1)).sum(dim=1)
         out = rearrange(out, "b (h w) c -> b c h w", h=h)
-        
+        mask = rearrange(mask,'b m (h w) -> b m h w',h=h)
+
         #recovering splitted patches
         if self.fold_w>1 and self.fold_h>1:
             out = rearrange(out, "(b f1 f2) c h w -> b c (f1 h) (f2 w)", f1=self.fold_h, f2=self.fold_w)
-        
+            mask = rearrange(mask,"(b f1 f2) m h w -> b m (f1 h) (f2 w)", f1=self.fold_h, f2=self.fold_w)
+
         #regrouping heads
         out = rearrange(out, "(b e) c h w -> b (e c) h w", e=self.heads)
+        #mask = rearrange(mask,"(b e) m h w -> b (e m) h w", e=self.heads)
         out = self.fc2(out)
-
+        
+        if getmask : return out,mask
         return out
+
 
 class MLP(nn.Module):
     def __init__(self,in_channels,hidden_channels,out_channels,act,dropout=0):
@@ -149,41 +156,70 @@ class MLP(nn.Module):
         out = self.net(x)
         return out
 
+
 class ClusterBlock(nn.Module):
     
-    def __init__(self,in_channels,act=nn.GELU,mlp_ratio=4,dropout=0,droppath=0,proposal_w=2,proposal_h=2,fold_w=2,fold_h=2,heads=4,head_dim=16,norm_layer=GroupNorm):
+    def __init__(self,in_channels,act=nn.GELU,mlp_ratio=4,dropout=0,droppath=0,
+                 proposal_w=2,proposal_h=2,fold_w=2,fold_h=2,
+                 heads=4,head_dim=16,norm_layer=GroupNorm,ablation=False, getmask=False):
         super().__init__()
-        
+
         #(in_channels,out_channels,heads,head_dim,proposal_w=2,proposal_h=2,fold_w=2,fold_h=2))
-        self.cluster = Cluster(in_channels,in_channels,heads,head_dim,proposal_w,proposal_h,fold_w,fold_h)
+        self.ablation = ablation
+        
+        if not ablation:
+            self.cluster = Cluster(in_channels,in_channels,heads,head_dim,proposal_w,proposal_h,fold_w,fold_h)
         hidden_dim = int(mlp_ratio*in_channels)
         self.mlp = MLP(in_channels,hidden_dim,in_channels,act,dropout=dropout)
         self.norm1 = norm_layer(in_channels)
         self.norm2 = norm_layer(in_channels)
         
         self.droppath = DropPath(droppath)
+        self.getmask = getmask
         
     def forward(self,x):
-        x = x + self.droppath(self.cluster(self.norm1(x))) #skip conn
-        out = x + self.droppath(self.mlp(self.norm2(x))) #skip conn
+        if not self.ablation:
+            x1 = self.cluster(self.norm1(x),getmask=self.getmask)
+            if self.getmask:
+                x1,mask = x1
+            x = x + self.droppath(x1) #skip connection
+        out = x + self.droppath(self.mlp(self.norm2(x))) #skip connection
+        if self.getmask : return out,mask
         return out
 
+
 class BasicBlock(nn.Module):
-    def __init__(self,in_channels,out_channels,N=1,heads=4,head_dim=16,mlp_ratio=4,fold=2,norm_layer=GroupNorm,dropout=0,droppath=0):
+    def __init__(self,in_channels,out_channels,N=1,
+                 heads=4,head_dim=16,mlp_ratio=4,fold=2,
+                 norm_layer=GroupNorm,dropout=0,droppath=0,
+                 first_layer=False,ablation=False):
         super().__init__()
-        self.point_red = PointReducer(in_channels,out_channels)
+        self.red = not first_layer
+        if not first_layer:
+            self.point_red = PointReducer(in_channels,out_channels)
         layers = []
-        for i in range(N):
-            layers.append(ClusterBlock(out_channels,heads=heads,head_dim=head_dim,mlp_ratio=mlp_ratio,norm_layer=norm_layer,dropout=dropout,droppath=droppath,fold_h=fold,fold_w=fold))
+        for i in range(N-1):
+            layers.append(ClusterBlock(out_channels,heads=heads,head_dim=head_dim,mlp_ratio=mlp_ratio,norm_layer=norm_layer,dropout=dropout,droppath=droppath,fold_h=fold,fold_w=fold,ablation=ablation))
+        layers.append(ClusterBlock(out_channels,heads=heads,head_dim=head_dim,mlp_ratio=mlp_ratio,norm_layer=norm_layer,dropout=dropout,droppath=droppath,fold_h=fold,fold_w=fold,ablation=ablation,
+                                   getmask=True))
         self.cluster_b = nn.Sequential(*layers)
     
     def forward(self,x):
-        x = self.point_red(x)
-        x = self.cluster_b(x)
+        if self.red:
+            x = self.point_red(x)
+        x,mask = self.cluster_b(x)
         return x
+    
+    def getmask(self,x):
+        if self.red:
+            x = self.point_red(x)
+        x,mask = self.cluster_b(x)
+        return x,mask
+
 
 class Model(nn.Module):
-    def __init__(self,embedding_sizes,num_classes,n_blocks=[1,1,1,1],head_counts=[4,4,4,4],head_dims=[16,16,16,16],mlp_ratios=[4,4,4,4],norm_layer=GroupNorm,dropout=0,droppath=0):
+    def __init__(self,embedding_sizes,num_classes,n_blocks=[1,1,1,1],head_counts=[4,4,4,4],head_dims=[16,16,16,16],
+                 mlp_ratios=[4,4,4,4],norm_layer=GroupNorm,dropout=0,droppath=0,ablation=False):
         super().__init__()
         layers = []
         in_channels = 5
@@ -192,7 +228,7 @@ class Model(nn.Module):
             #layers.append(BasicBlock(in_channels,out_channels,norm_layer=norm_layer,dropout=dropout))
             #in_channels = out_channels
 
-
+        first_layer = True
         for stage,out_channels in enumerate(embedding_sizes):
             N = n_blocks[stage]
             heads = head_counts[stage]
@@ -200,16 +236,17 @@ class Model(nn.Module):
             mlp_ratio= mlp_ratios[stage]
             fold = folds[stage]
             
-            layers.append(BasicBlock(in_channels,out_channels,N=N,heads=heads,head_dim=head_dim,mlp_ratio=mlp_ratio,fold=fold,norm_layer=norm_layer,dropout=dropout,droppath=droppath))
+            layers.append(BasicBlock(in_channels,out_channels,N=N,heads=heads,head_dim=head_dim,mlp_ratio=mlp_ratio,
+                                     fold=fold,norm_layer=norm_layer,dropout=dropout,droppath=droppath,
+                                     first_layer=first_layer,ablation=ablation))
             in_channels = out_channels
-
+            first_layer=False
 
         
         self.feature_extractor = nn.Sequential(*layers)
         self.clf = nn.Linear(embedding_sizes[-1],num_classes)
         self.old_shape = None
-
-
+        
     def imgs_to_SoP(self,imgs):
         """
         Transform a batch of images to a bacth of sets of points
@@ -218,6 +255,8 @@ class Model(nn.Module):
         return : torch.Tensor([batch,chan+2,height*width])
         """
         shape = imgs.shape
+        device = imgs.device
+        
         if self.old_shape != shape:
             self.old_shape = shape
             height = shape[-2]
@@ -228,11 +267,10 @@ class Model(nn.Module):
             ind_h = torch.arange(height)/(height-1)-0.5
             ind = torch.stack(torch.meshgrid(ind_w,ind_h,indexing = 'ij'),dim = -1).reshape(2,height,width)
 
-            self.batch_ind = ind.repeat(batch,1,1,1)
-        
-        device = imgs.device
+            self.batch_ind = ind.repeat(batch,1,1,1).to(device)
+            
         #flat_imgs = imgs.flatten(start_dim=len(shape)-2)
-        SoP = torch.cat((imgs,self.batch_ind.to(device)),dim=1) #might need to clone
+        SoP = torch.cat((imgs,self.batch_ind),dim=1)
         
         return SoP
 
@@ -242,3 +280,11 @@ class Model(nn.Module):
         features = torch.mean(features, dim = (2,3))
         yhat = self.clf(features)
         return yhat
+    
+    def getmask(self,input):
+        SoP = self.imgs_to_SoP(input)
+        masks = []
+        for mod in self.feature_extractor:
+            SoP,mask = mod.getmask(SoP)
+            masks.append(mask.clone())
+        return input, masks
